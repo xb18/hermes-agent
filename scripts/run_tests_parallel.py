@@ -45,8 +45,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -379,7 +381,27 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+
+    # Give this subprocess its own pytest temp root.
+    #
+    # pytest derives its tmp_path root as <temproot>/pytest-of-<user>/ and, at
+    # session finish, calls cleanup_dead_symlinks() over that directory. That
+    # walk is a check-then-act: it lists the directory, tests whether the
+    # `pytest-current` symlink resolves, and then unlinks it. With every file
+    # sharing one root, a second process replaces or removes that symlink
+    # between the check and the unlink, and the first process dies with
+    # FileNotFoundError AFTER its tests all passed. The failure therefore
+    # reports as a whole-file failure with a green test summary above it.
+    #
+    # The odds scale with the number of processes finishing at once, so this
+    # was invisible at 8 workers and appears at 144.
+    #
+    # One root per subprocess removes the shared directory the race needs.
+    # The parent removes the root after the attempt.
+    env = os.environ.copy()
+    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+    env["PYTEST_DEBUG_TEMPROOT"] = temproot
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -388,7 +410,7 @@ def _run_one_file_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
+        env=env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -432,6 +454,11 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+    finally:
+        # Remove this attempt's temp root. Nothing reads it after the
+        # subprocess exits, and 3000+ of them would otherwise fill the
+        # runner's disk over one suite.
+        shutil.rmtree(temproot, ignore_errors=True)
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a

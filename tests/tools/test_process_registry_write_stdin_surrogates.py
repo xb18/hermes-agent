@@ -30,9 +30,24 @@ def test_write_stdin_pty_surrogateescape_roundtrip(tmp_path):
             session.id, b"\xff".decode("utf-8", "surrogateescape") + "\n"
         )
         assert result["status"] == "ok", result
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not out.exists():
+        # Wait for the CONTENT, not for the file to exist. The child runs
+        # open(out,'wb').write(...), so the file is created EMPTY at open()
+        # time and filled only once the PTY delivers the line. The previous
+        # wait stopped at out.exists(), which the empty file satisfies, so
+        # the read returned b'' whenever the parent won that gap. On a
+        # 144-worker runner the gap is wide enough to lose deterministically
+        # (this failed both attempts in CI, not just once); it also loses
+        # 6 times in 25 runs on an unloaded 16-core box.
+        deadline = time.monotonic() + 30
+        got = b""
+        while time.monotonic() < deadline:
+            try:
+                got = out.read_bytes()
+            except FileNotFoundError:
+                got = b""
+            if got == b"\xff\n":
+                break
             time.sleep(0.05)
-        assert out.read_bytes() == b"\xff\n"
+        assert got == b"\xff\n"
     finally:
         registry.kill_process(session.id)

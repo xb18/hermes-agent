@@ -24,6 +24,7 @@ file to the allowlist without a reason of the same class.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -49,6 +50,9 @@ ALLOWLIST = {
 EXCLUDED_DIR_PARTS = {
     "tests", ".venv", ".git", ".worktrees", "node_modules", "website",
     "docs", "scripts", "examples", "apps",
+    # Compiled bytecode is not source, and sibling test processes create and
+    # delete these while this scan walks the tree.
+    "__pycache__",
 }
 
 # A safe_load within this many lines of a config.yaml reference is treated
@@ -60,11 +64,23 @@ CONFIG_YAML_RE = re.compile(r"""["']config\.yaml["']""")
 
 
 def _iter_source_files():
-    for path in REPO_ROOT.rglob("*.py"):
-        rel = path.relative_to(REPO_ROOT)
-        if any(part in EXCLUDED_DIR_PARTS for part in rel.parts):
-            continue
-        yield rel, path
+    # os.walk with a pruned dirnames, not rglob: rglob descends into every
+    # directory and only then filters, so it scandir()s trees this guard
+    # never inspects. Sibling test processes create and delete __pycache__
+    # entries throughout the run, and a directory that disappears mid-walk
+    # raises FileNotFoundError out of rglob and fails this test for a reason
+    # unrelated to what it asserts. Pruning skips those trees, and onerror
+    # ignores a directory that vanishes anyway.
+    for dirpath, dirnames, filenames in os.walk(REPO_ROOT, onerror=lambda _e: None):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_PARTS]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            path = Path(dirpath) / name
+            rel = path.relative_to(REPO_ROOT)
+            if any(part in EXCLUDED_DIR_PARTS for part in rel.parts):
+                continue
+            yield rel, path
 
 
 def test_no_raw_config_yaml_reads_outside_owner_modules():
